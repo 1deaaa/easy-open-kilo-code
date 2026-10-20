@@ -52,6 +52,11 @@ python easy-open-kilo-code.pyw
 - 支持创建、删除、重命名 Provider
 - 自动探测服务端支持的模型列表
 - 连通性测试和流式输出测速
+  - 测试进行中按钮显示旋转进度环；流式测速收到首段正文后，按钮切换为秒级计时（1、2、3、4、5）
+  - 流式测速提示词引导模型输出 1000 个 `hello`，以重复单元数近似 token 数，不依赖上游 `usage`
+  - 忽略推理内容，只等待正文：首段正文到达后固定采样 5 秒并主动中断请求
+  - 等待正文最长 30 秒，超时则判定为测速超时
+  - 测速输出「首字延迟(TTFT)」「正文延迟」与「生成速度（tokens/秒）」
 - 支持 OpenAI Compatible、OpenAI Responses、原生 Gemini 和原生 Grok 协议
 - 根据协议自动补全 API 版本端点（原生 Gemini 使用 `/v1beta`，其余协议使用 `/v1`）
 - 原生 Gemini 请求使用 `/v1beta/models/{模型}:generateContent`，不会拼接 `/chat/completions`

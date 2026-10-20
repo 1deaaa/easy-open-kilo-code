@@ -15,7 +15,7 @@ import time
 import subprocess
 import hashlib
 from pathlib import Path
-from typing import Optional, Dict, List, Any, Callable
+from typing import Optional, Dict, List, Any, Callable, Iterable, NamedTuple
 
 import requests
 import platformdirs
@@ -34,6 +34,21 @@ WINDOW_HEIGHT = 880
 # 新添加模型的默认上下文/输出限制（单位：token）
 DEFAULT_MODEL_CONTEXT = 500000
 DEFAULT_MODEL_OUTPUT = 64000
+
+# 流式测速采样窗口：收到首段正文后固定采样该时长，随后主动中断请求
+SPEED_SAMPLE_WINDOW = 5.0
+# 流式测速等待正文的首字超时（秒）：超时内未收到正文则判为超时
+SPEED_BODY_TIMEOUT = 30.0
+# 测速请求超时（连接超时, 读取超时）
+SPEED_TEST_TIMEOUT = (10, 30)
+# 速度计算的最小时间窗（秒），避免单帧到达时除零
+MIN_SPEED_WINDOW = 0.001
+# 测速提示词：引导模型输出可按 token 计数的重复内容（不依赖上游 usage）
+SPEED_TEST_PROMPT = (
+    "本次测试禁止任何思考 以空格分割 立刻以最快速度输出1000个hello 禁止输出其他任何字符和内容"
+)
+# 测速计数单元：绝大多数分词器下独立单词 "hello" 恰好等于 1 个 token
+SPEED_TEST_UNIT = "hello"
 
 
 def get_system_font_family() -> str:
@@ -435,15 +450,21 @@ def build_model_test_request(
     protocol: str,
     model_id: str,
     prompt: str,
-    max_tokens: int,
+    max_tokens: Optional[int] = None,
     stream: bool = False,
 ) -> Dict[str, Any]:
-    """构造连通性探测或流式测速的 HTTP 请求参数。"""
+    """构造连通性探测或流式测速的 HTTP 请求参数。
+
+    max_tokens 为 None 时不携带任何输出长度限制，由调用方自行控制中断时机。
+    """
     base = ensure_protocol_endpoint(base_url, protocol)
     if protocol == "gemini_native":
         clean_model_id = model_id.removeprefix("models/")
         action = "streamGenerateContent" if stream else "generateContent"
         params = {"alt": "sse"} if stream else None
+        generation_config: Dict[str, Any] = {}
+        if max_tokens:
+            generation_config["maxOutputTokens"] = max_tokens
         return {
             "url": f"{base}/models/{clean_model_id}:{action}",
             "headers": {
@@ -453,7 +474,7 @@ def build_model_test_request(
             "params": params,
             "payload": {
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generationConfig": {"maxOutputTokens": max_tokens},
+                "generationConfig": generation_config,
             },
         }
 
@@ -473,7 +494,7 @@ def build_model_test_request(
                         "content": [{"type": "input_text", "text": prompt}],
                     }
                 ],
-                "max_output_tokens": max_tokens,
+                **({"max_output_tokens": max_tokens} if max_tokens else {}),
                 **({"stream": True} if stream else {}),
             },
         }
@@ -488,30 +509,280 @@ def build_model_test_request(
         "payload": {
             "model": model_id,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
+            **({"max_tokens": max_tokens} if max_tokens else {}),
             **({"stream": True} if stream else {}),
         },
     }
 
 
-def extract_stream_text(data: Dict[str, Any], protocol: str) -> str:
-    """从不同协议的 SSE 流式事件 JSON 中提取生成文本。"""
+class StreamDelta(NamedTuple):
+    """单条流式事件中解析出的增量文本。
+
+    推理模型会先流式输出思考内容(reasoning)，思考结束后才输出正文(content)，
+    两者分开统计，便于在测速报告中标注各自的字数。
+    """
+
+    reasoning: str = ""
+    content: str = ""
+
+
+def extract_stream_delta(data: Dict[str, Any], protocol: str) -> StreamDelta:
+    """从不同协议的 SSE 流式事件 JSON 中提取增量文本（思考内容与正文内容分列）。
+
+    - Responses API 事件流（OpenAI Responses / Grok Native）：
+      {"type": "response.output_text.delta", "delta": "..."}
+    - Gemini 原生事件流：思考片段以 parts[].thought=True 标记
+    - OpenAI 兼容 chat/completions 事件流：delta.reasoning_content / delta.reasoning / delta.content
+    """
+    # Responses API 风格事件：依据事件类型区分思考与正文增量
+    event_type = data.get("type") or ""
+    if event_type.startswith("response."):
+        if event_type == "response.output_text.delta":
+            return StreamDelta("", data.get("delta") or "")
+        if event_type.startswith("response.reasoning") and event_type.endswith(".delta"):
+            return StreamDelta(data.get("delta") or "", "")
+        # 其余事件（created / done / usage 等）不携带增量正文
+        return StreamDelta()
+
+    # Gemini 原生事件流
     if protocol == "gemini_native":
-        candidates = data.get("candidates", [])
-        if not candidates:
-            return ""
-        parts = candidates[0].get("content", {}).get("parts", [])
-        return "".join(part.get("text", "") for part in parts)
+        reasoning_parts: List[str] = []
+        content_parts: List[str] = []
+        for candidate in data.get("candidates") or []:
+            for part in (candidate.get("content") or {}).get("parts") or []:
+                text = part.get("text") or ""
+                if not text:
+                    continue
+                if part.get("thought") is True:
+                    reasoning_parts.append(text)
+                else:
+                    content_parts.append(text)
+        return StreamDelta("".join(reasoning_parts), "".join(content_parts))
 
-    if protocol == "grok_native":
-        if data.get("type") == "response.output_text.delta":
-            return data.get("delta", "")
-        return ""
-
-    choices = data.get("choices", [])
+    # OpenAI 兼容 chat/completions 事件流
+    choices = data.get("choices") or []
     if not choices:
-        return ""
-    return choices[0].get("delta", {}).get("content", "")
+        return StreamDelta()
+    # 流式为 delta；服务端忽略 stream 参数时返回完整 message
+    payload = choices[0].get("delta") or choices[0].get("message") or {}
+    # 思考字段名各家不一：reasoning_content(DeepSeek/SiliconFlow/vLLM)、reasoning(OpenRouter)
+    reasoning = (
+        payload.get("reasoning_content")
+        or payload.get("reasoning")
+        or payload.get("reasoning_text")
+        or ""
+    )
+    content = payload.get("content") or ""
+    return StreamDelta(reasoning, content)
+
+
+def extract_finish_reason(data: Dict[str, Any], protocol: str) -> str:
+    """提取流式响应的结束原因（stop / length 等），用于诊断模型输出状态。"""
+    if protocol == "gemini_native":
+        candidates = data.get("candidates") or []
+        if candidates:
+            return candidates[0].get("finishReason") or ""
+    choices = data.get("choices") or []
+    if choices:
+        return choices[0].get("finish_reason") or ""
+    if data.get("type") == "response.incomplete":
+        return "length"
+    return ""
+
+
+def _is_timeout_error(err: Exception) -> bool:
+    """判断异常是否为超时。
+
+    requests 在流式读取时会把底层读取超时（urllib3 的 ReadTimeoutError）
+    包装成 ConnectionError，这里沿异常链统一识别。
+    """
+    if isinstance(err, requests.exceptions.Timeout):
+        return True
+    seen = set()
+    stack: List[BaseException] = [err]
+    while stack:
+        cur = stack.pop()
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        if type(cur).__name__ in ("ReadTimeoutError", "ReadTimeout"):
+            return True
+        stack.extend(a for a in getattr(cur, "args", ()) if isinstance(a, BaseException))
+    return False
+
+
+def collect_stream_stats(
+    lines: Iterable[bytes],
+    protocol: str,
+    start_t: float,
+    body_timeout: float = SPEED_BODY_TIMEOUT,
+    sample_window: float = SPEED_SAMPLE_WINDOW,
+    on_first_body: Optional[Callable[[], None]] = None,
+    on_tick: Optional[Callable[[int], None]] = None,
+) -> Dict[str, Any]:
+    """消费 SSE 行流，统计首个正文到达时刻与采样窗口内的 token 数。
+
+    - 忽略推理内容，只等待正文
+    - 收到首段正文后固定采样 sample_window 秒
+    - body_timeout 内仍未收到正文则判定为超时
+    - on_tick 以秒为粒度回调，用于驱动界面上的计时显示
+    """
+    state: Dict[str, Any] = {
+        "first_token_t": None,
+        "first_body_t": None,
+        "body_text": "",
+        "reasoning_chars": 0,
+        "token_count": 0,
+        "sample_duration": 0.0,
+        "body_timeout": False,
+        "body_timeout_limit": body_timeout,
+        "finish_reason": "",
+    }
+    stop_event = threading.Event()
+
+    def countdown():
+        """采样窗口内的秒级计时，按 1..N 逐秒回调。"""
+        started = time.time()
+        shown = 0
+        while not stop_event.wait(0.2):
+            second = min(int(time.time() - started) + 1, int(sample_window))
+            if second > shown:
+                shown = second
+                if on_tick:
+                    on_tick(second)
+
+    try:
+        for line in lines:
+            if not line:
+                continue
+            now = time.time()
+            if state["first_body_t"] is None and now - start_t > body_timeout:
+                state["body_timeout"] = True
+                break
+            decoded = line.decode("utf-8", errors="replace").strip()
+            if decoded.startswith("data:"):
+                raw_data = decoded[5:].strip()
+                if raw_data == "[DONE]":
+                    break
+            else:
+                # 服务端忽略 stream 参数时直接返回完整 JSON 响应体
+                raw_data = decoded
+            if not raw_data.startswith("{"):
+                continue
+            try:
+                json_chunk = json.loads(raw_data)
+            except Exception:
+                continue
+
+            reason = extract_finish_reason(json_chunk, protocol)
+            if reason:
+                state["finish_reason"] = reason
+
+            delta = extract_stream_delta(json_chunk, protocol)
+            if not delta.reasoning and not delta.content:
+                continue
+
+            if state["first_token_t"] is None:
+                state["first_token_t"] = now
+            state["reasoning_chars"] += len(delta.reasoning)
+            if not delta.content:
+                # 忽略推理内容，只等正文
+                continue
+
+            if state["first_body_t"] is None:
+                state["first_body_t"] = now
+                if on_first_body:
+                    on_first_body()
+                threading.Thread(target=countdown, daemon=True).start()
+            state["body_text"] += delta.content
+
+            if now - state["first_body_t"] >= sample_window:
+                break
+    except Exception as err:
+        # 采样窗口到点后请求被主动中断，属预期行为，保留已统计到的内容；
+        # 若此时仍未收到正文，则判定为等待正文超时
+        if state["first_body_t"] is None and _is_timeout_error(err):
+            state["body_timeout"] = True
+    finally:
+        stop_event.set()
+
+    if state["first_body_t"] is not None:
+        state["sample_duration"] = max(
+            time.time() - state["first_body_t"], MIN_SPEED_WINDOW
+        )
+    # 以重复单元的数量近似 token 数：独立单词 "hello" 在各主流分词器下均为 1 token
+    state["token_count"] = state["body_text"].lower().count(SPEED_TEST_UNIT)
+    return state
+
+
+def measure_stream_speed(
+    resp: "requests.Response",
+    protocol: str,
+    start_t: float,
+    body_timeout: float = SPEED_BODY_TIMEOUT,
+    sample_window: float = SPEED_SAMPLE_WINDOW,
+    on_first_body: Optional[Callable[[], None]] = None,
+    on_tick: Optional[Callable[[int], None]] = None,
+) -> Dict[str, Any]:
+    """消费流式响应并统计生成速度（以 token 计）。
+
+    收到首段正文后固定采样 sample_window 秒，随后主动关闭响应中断请求，
+    因此模型无需设置输出长度上限。
+    """
+    abort_timer = None
+
+    def handle_first_body():
+        """首段正文到达：启动中断计时器并通知界面切换为秒级计时。"""
+        nonlocal abort_timer
+        abort_timer = threading.Timer(sample_window, resp.close)
+        abort_timer.daemon = True
+        abort_timer.start()
+        if on_first_body:
+            on_first_body()
+
+    try:
+        return collect_stream_stats(
+            resp.iter_lines(),
+            protocol,
+            start_t,
+            body_timeout=body_timeout,
+            sample_window=sample_window,
+            on_first_body=handle_first_body,
+            on_tick=on_tick,
+        )
+    finally:
+        if abort_timer is not None:
+            abort_timer.cancel()
+
+
+def format_speed_report(stats: Dict[str, Any], start_t: float) -> str:
+    """将测速统计结果格式化为一行提示文本。"""
+    if stats.get("body_timeout"):
+        detail = "（仅收到思考内容）" if stats.get("reasoning_chars") else ""
+        limit = stats.get("body_timeout_limit") or SPEED_BODY_TIMEOUT
+        return f"测速超时: {limit:.0f}s 内未收到正文{detail}"
+
+    first_body_t = stats.get("first_body_t")
+    if first_body_t is None:
+        return "测速失败: 未收到模型正文输出"
+
+    first_token_t = stats.get("first_token_t") or first_body_t
+    ttft = (first_token_t - start_t) * 1000
+    body_delay = (first_body_t - start_t) * 1000
+    duration = stats.get("sample_duration") or MIN_SPEED_WINDOW
+    tokens = stats.get("token_count", 0)
+    speed = tokens / duration
+
+    parts = [f"首字延迟(TTFT): {ttft:.0f}ms"]
+    if body_delay - ttft > 50:
+        # 存在明显的思考阶段，额外给出正文起始延迟
+        parts.append(f"正文延迟: {body_delay:.0f}ms")
+    parts.append(f"生成速度: {speed:.1f} tokens/秒")
+    parts.append(f"采样 {duration:.1f}s · {tokens} tokens")
+    if str(stats.get("finish_reason", "")).lower() == "stop":
+        # 模型在采样窗口内自行输出完毕，而非被我们中断
+        parts.append("模型已输出完毕")
+    return " | ".join(parts)
 
 
 
@@ -1173,6 +1444,52 @@ class AddVariantDialog:
 # ██  SECTION 7: Flet 视图组件 (ProviderView, McpCompactionView, InstructionsView)
 # ████████████████████████████████████████████████████████████████████████████████
 
+class BusyButton:
+    """带加载动画的按钮包装器。
+
+    空闲态显示原按钮控件；执行耗时操作期间把宿主容器的内容替换为旋转进度环，
+    让用户明确感知到“正在测速/测试”，结束后还原。
+
+    这里刻意使用 Container.content 作为切换位：它是 Flet 中语义最单一的控制位，
+    不会出现「图标与内容同时存在」的优先级歧义。
+    """
+
+    def __init__(
+        self,
+        control: ft.Control,
+        busy_content: Optional[Callable[[], ft.Control]] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+    ):
+        self.control = control
+        self._busy_content = busy_content or (
+            lambda: ft.ProgressRing(width=20, height=20, stroke_width=2)
+        )
+        self.host = ft.Container(
+            width=width,
+            height=height,
+            alignment=ft.alignment.center,
+            content=control,
+        )
+
+    def set_busy(self, busy: bool, page: Optional[ft.Page] = None):
+        """切换加载动画状态。"""
+        try:
+            self.host.content = self._busy_content() if busy else self.control
+            self.control.disabled = busy
+            safe_update(self.host, page)
+        except Exception:
+            pass
+
+    def set_busy_content(self, content: ft.Control, page: Optional[ft.Page] = None):
+        """在忙碌期间替换动画内容（如秒级计时数字）。"""
+        try:
+            self.host.content = content
+            safe_update(self.host, page)
+        except Exception:
+            pass
+
+
 class ProviderView(ft.Container):
     """Provider 与模型管理视图：包含左侧 Provider 列表与右侧端点、密钥及模型卡片明细。"""
 
@@ -1182,6 +1499,8 @@ class ProviderView(ft.Container):
         self.on_change_callback = on_change
         self.providers_data: Dict[str, Any] = {}
         self.current_provider_name: Optional[str] = None
+        # 模型卡片上的测试按钮：{model_id: {"connect": BusyButton, "speed": BusyButton}}
+        self._test_buttons: Dict[str, Dict[str, BusyButton]] = {}
 
         self._build_ui()
 
@@ -1246,6 +1565,13 @@ class ProviderView(ft.Container):
         self.btn_probe = ft.FilledButton("探测可用模型", icon=ft.Icons.TRAVEL_EXPLORE, on_click=self._on_probe_models)
         self.btn_add_model = ft.OutlinedButton("手动添加模型", icon=ft.Icons.ADD, on_click=self._on_add_model_manual)
         self.btn_test_provider = ft.OutlinedButton("测试当前配置", icon=ft.Icons.NETWORK_CHECK, on_click=self._on_test_provider)
+        self._provider_test_btn = BusyButton(
+            self.btn_test_provider,
+            busy_content=lambda: ft.Row(
+                [ft.ProgressRing(width=16, height=16, stroke_width=2), ft.Text("测试当前配置", size=14)],
+                spacing=8,
+            ),
+        )
 
         self.models_list_col = ft.ListView(expand=True, spacing=10)
 
@@ -1261,7 +1587,7 @@ class ProviderView(ft.Container):
                                 [
                                     ft.Row([self.name_field, self.protocol_dropdown], spacing=12),
                                     ft.Row([self.base_url_field, self.api_key_field], spacing=12),
-                                    ft.Row([self.btn_probe, self.btn_add_model, self.btn_test_provider], spacing=10),
+                                    ft.Row([self.btn_probe, self.btn_add_model, self._provider_test_btn.host], spacing=10),
                                 ],
                                 spacing=10,
                             ),
@@ -1472,6 +1798,7 @@ class ProviderView(ft.Container):
 
     def _refresh_models_list(self):
         self.models_list_col.controls.clear()
+        self._test_buttons.clear()
         if not self.current_provider_name or self.current_provider_name not in self.providers_data:
             return
 
@@ -1543,6 +1870,29 @@ class ProviderView(ft.Container):
             on_click=lambda e, mid=model_id: self._toggle_variants(mid, protocol),
         )
 
+        # 测试按钮（带加载动画）
+        connect_tooltip = "连通性测试 (发送 'Hi')"
+        connect_btn = BusyButton(
+            ft.IconButton(
+                icon=ft.Icons.PLAY_ARROW,
+                tooltip=connect_tooltip,
+                on_click=lambda e, mid=model_id: self._test_model(mid),
+            ),
+            width=48,
+            height=48,
+        )
+        speed_tooltip = "流式测速"
+        speed_btn = BusyButton(
+            ft.IconButton(
+                icon=ft.Icons.SPEED,
+                tooltip=speed_tooltip,
+                on_click=lambda e, mid=model_id: self._test_speed(mid),
+            ),
+            width=48,
+            height=48,
+        )
+        self._test_buttons[model_id] = {"connect": connect_btn, "speed": speed_btn}
+
         card = ft.Card(
             content=ft.Container(
                 padding=12,
@@ -1563,16 +1913,8 @@ class ProviderView(ft.Container):
                                         context_field,
                                         output_field,
                                         image_switch,
-                                        ft.IconButton(
-                                            icon=ft.Icons.PLAY_ARROW,
-                                            tooltip="连通性测试 (发送 'Hi')",
-                                            on_click=lambda e, mid=model_id: self._test_model(mid),
-                                        ),
-                                        ft.IconButton(
-                                            icon=ft.Icons.SPEED,
-                                            tooltip="流式测速",
-                                            on_click=lambda e, mid=model_id: self._test_speed(mid),
-                                        ),
+                                        connect_btn.host,
+                                        speed_btn.host,
                                         ft.IconButton(
                                             icon=ft.Icons.DELETE_OUTLINE,
                                             tooltip="删除模型",
@@ -1751,14 +2093,32 @@ class ProviderView(ft.Container):
         if not models:
             self._show_snack("当前 Provider 尚未配置任何模型，无法测试", ft.Colors.ORANGE_400)
             return
-        self._test_model(models[0])
+        self._test_model(models[0], provider_level=True)
 
-    def _test_model(self, model_id: str):
+    def _set_test_busy(self, model_id: str, action: str, busy: bool):
+        """切换模型卡片测试按钮的加载动画状态。"""
+        button = (self._test_buttons.get(model_id) or {}).get(action)
+        if button:
+            button.set_busy(busy, self.page)
+
+    def _set_speed_countdown(self, model_id: str, second: int):
+        """测速进行中：把按钮上的加载动画切换为秒级计时（1、2、3、4、5…）。"""
+        button = (self._test_buttons.get(model_id) or {}).get("speed")
+        if button:
+            button.set_busy_content(
+                ft.Text(str(second), size=18, weight=ft.FontWeight.BOLD),
+                self.page,
+            )
+
+    def _test_model(self, model_id: str, provider_level: bool = False):
         base_url = self.base_url_field.value.strip()
         api_key = self.api_key_field.value.strip()
         protocol = self.protocol_dropdown.value
 
         self._show_snack(f"正在测试模型 {model_id}...", ft.Colors.BLUE_400)
+        self._set_test_busy(model_id, "connect", True)
+        if provider_level:
+            self._provider_test_btn.set_busy(True, self.page)
 
         def run_test():
             req = build_model_test_request(base_url, api_key, protocol, model_id, "Hi", 16, stream=False)
@@ -1778,6 +2138,10 @@ class ProviderView(ft.Container):
                     self._show_snack(f"测试失败 [{resp.status_code}]: {resp.text[:100]}", ft.Colors.RED_400)
             except Exception as err:
                 self._show_snack(f"连通异常: {err}", ft.Colors.RED_400)
+            finally:
+                self._set_test_busy(model_id, "connect", False)
+                if provider_level:
+                    self._provider_test_btn.set_busy(False, self.page)
 
         threading.Thread(target=run_test, daemon=True).start()
 
@@ -1787,15 +2151,18 @@ class ProviderView(ft.Container):
         protocol = self.protocol_dropdown.value
 
         self._show_snack(f"正在对 {model_id} 进行流式测速...", ft.Colors.BLUE_400)
+        self._set_test_busy(model_id, "speed", True)
 
         def run_speed():
+            # 引导模型输出可按 token 计数的重复内容，不限制输出长度：
+            # 收到首段正文后固定采样 5 秒并主动中断请求
             req = build_model_test_request(
                 base_url,
                 api_key,
                 protocol,
                 model_id,
-                "以'人工智能'为主题写一段50字的简介。",
-                128,
+                SPEED_TEST_PROMPT,
+                None,
                 stream=True,
             )
             try:
@@ -1806,47 +2173,42 @@ class ProviderView(ft.Container):
                     json=req["payload"],
                     params=req["params"],
                     stream=True,
-                    timeout=20,
+                    timeout=SPEED_TEST_TIMEOUT,
                 )
-                if resp.status_code != 200:
-                    self._show_snack(f"测速请求失败: HTTP {resp.status_code}", ft.Colors.RED_400)
-                    return
+                try:
+                    if resp.status_code != 200:
+                        self._show_snack(f"测速请求失败: HTTP {resp.status_code}", ft.Colors.RED_400)
+                        return
 
-                first_token_t = None
-                total_chars = 0
-                for line in resp.iter_lines():
-                    if line:
-                        decoded = line.decode("utf-8")
-                        if decoded.startswith("data: "):
-                            raw_data = decoded[6:].strip()
-                            if raw_data == "[DONE]":
-                                break
-                            try:
-                                json_chunk = json.loads(raw_data)
-                                text = extract_stream_text(json_chunk, protocol)
-                                if text:
-                                    if first_token_t is None:
-                                        first_token_t = time.time()
-                                    total_chars += len(text)
-                            except Exception:
-                                pass
+                    stats = measure_stream_speed(
+                        resp,
+                        protocol,
+                        start_t,
+                        body_timeout=SPEED_BODY_TIMEOUT,
+                        sample_window=SPEED_SAMPLE_WINDOW,
+                        on_first_body=lambda: self._set_speed_countdown(model_id, 1),
+                        on_tick=lambda second: self._set_speed_countdown(model_id, second),
+                    )
+                    if stats["body_timeout"]:
+                        self._show_snack(format_speed_report(stats, start_t), ft.Colors.RED_400, duration=6000)
+                        return
+                    if stats["first_body_t"] is None:
+                        self._show_snack("测速失败: 未收到模型正文输出", ft.Colors.RED_400)
+                        return
 
-                end_t = time.time()
-                ttft = ((first_token_t or end_t) - start_t) * 1000
-                duration = end_t - (first_token_t or start_t)
-                speed = (total_chars / duration) if duration > 0 else 0
-                self._show_snack(
-                    f"首字延迟(TTFT): {ttft:.0f}ms | 生成速度: {speed:.1f} 字/秒",
-                    ft.Colors.GREEN_400,
-                )
+                    self._show_snack(format_speed_report(stats, start_t), ft.Colors.GREEN_400, duration=6000)
+                finally:
+                    resp.close()
             except Exception as err:
                 self._show_snack(f"测速失败: {err}", ft.Colors.RED_400)
+            finally:
+                self._set_test_busy(model_id, "speed", False)
 
         threading.Thread(target=run_speed, daemon=True).start()
 
-    def _show_snack(self, message: str, color: str = ft.Colors.GREEN_400):
+    def _show_snack(self, message: str, color: str = ft.Colors.GREEN_400, duration: int = 4000):
         if self.page:
-            sb = ft.SnackBar(content=ft.Text(message), bgcolor=color, duration=4000)
+            sb = ft.SnackBar(content=ft.Text(message), bgcolor=color, duration=duration)
             self.page.open(sb)
 
 
